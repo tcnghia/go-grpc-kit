@@ -15,15 +15,15 @@ import (
 	"net"
 	"net/url"
 	"sync"
-	"time"
 
-	grpc_retry "github.com/grpc-ecosystem/go-grpc-middleware/retry"
+	"chainguard.dev/go-grpc-kit/proto/grpc/service_config"
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/kelseyhightower/envconfig"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/encoding/protojson"
 	"knative.dev/pkg/logging"
 )
 
@@ -112,12 +112,21 @@ func enableClientTimeHistogram() {
 	}
 }
 
-func GRPCOptions(delegate url.URL) (string, []grpc.DialOption) {
-	retryOpts := []grpc_retry.CallOption{
-		grpc_retry.WithBackoff(grpc_retry.BackoffExponential(100 * time.Millisecond)),
-		grpc_retry.WithMax(getEnv().GrpcClientMaxRetry),
+func GRPCOptions(delegate url.URL, serviceConfig ...*service_config.ServiceConfig) (string, []grpc.DialOption) {
+	httpxOptions := []grpc.DialOption{
+		grpc.WithChainUnaryInterceptor(grpc_prometheus.UnaryClientInterceptor, otelgrpc.UnaryClientInterceptor()),
+		grpc.WithChainStreamInterceptor(grpc_prometheus.StreamClientInterceptor, otelgrpc.StreamClientInterceptor()),
+		grpc.WithBlock(),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(RecvMsgSize),
+			grpc.MaxCallSendMsgSize(SendMsgSize),
+		),
 	}
-
+	if len(serviceConfig) > 0 {
+		if serviceConfigJSON, err := protojson.Marshal(serviceConfig[0]); err != nil {
+			httpxOptions = append(httpxOptions, grpc.WithDefaultServiceConfig(string(serviceConfigJSON)))
+		}
+	}
 	switch delegate.Scheme {
 	case "http":
 		port := "80"
@@ -126,16 +135,8 @@ func GRPCOptions(delegate url.URL) (string, []grpc.DialOption) {
 			port = delegate.Port()
 		}
 		enableClientTimeHistogram()
-		return net.JoinHostPort(delegate.Hostname(), port), []grpc.DialOption{
-			grpc.WithChainUnaryInterceptor(grpc_prometheus.UnaryClientInterceptor, otelgrpc.UnaryClientInterceptor(), grpc_retry.UnaryClientInterceptor(retryOpts...)),
-			grpc.WithChainStreamInterceptor(grpc_prometheus.StreamClientInterceptor, otelgrpc.StreamClientInterceptor(), grpc_retry.StreamClientInterceptor(retryOpts...)),
-			grpc.WithBlock(),
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithDefaultCallOptions(
-				grpc.MaxCallRecvMsgSize(RecvMsgSize),
-				grpc.MaxCallSendMsgSize(SendMsgSize),
-			),
-		}
+		return net.JoinHostPort(delegate.Hostname(), port),
+			append(httpxOptions, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	case "https":
 		port := "443"
 		// Explicit port from the user signifies we should override the scheme-based defaults.
@@ -143,18 +144,10 @@ func GRPCOptions(delegate url.URL) (string, []grpc.DialOption) {
 			port = delegate.Port()
 		}
 		enableClientTimeHistogram()
-		return net.JoinHostPort(delegate.Hostname(), port), []grpc.DialOption{
-			grpc.WithChainUnaryInterceptor(grpc_prometheus.UnaryClientInterceptor, otelgrpc.UnaryClientInterceptor(), grpc_retry.UnaryClientInterceptor(retryOpts...)),
-			grpc.WithChainStreamInterceptor(grpc_prometheus.StreamClientInterceptor, otelgrpc.StreamClientInterceptor(), grpc_retry.StreamClientInterceptor(retryOpts...)),
-			grpc.WithBlock(),
-			grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
+		return net.JoinHostPort(delegate.Hostname(), port),
+			append(httpxOptions, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
 				MinVersion: tls.VersionTLS12,
-			})),
-			grpc.WithDefaultCallOptions(
-				grpc.MaxCallRecvMsgSize(RecvMsgSize),
-				grpc.MaxCallSendMsgSize(SendMsgSize),
-			),
-		}
+			})))
 
 	case "bufnet": // This is to support testing, it will not pass webhook validation.
 		return "bufnet", []grpc.DialOption{
